@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+import "@openzeppelin/contracts@4.9.6/security/ReentrancyGuard.sol";
+contract MultiSigLite is ReentrancyGuard {
+    uint256 public constant MODIFY_DE_DELAY = 10000 days;
+    uint256 public constant VOTE_PERIOD = 24 hours;
+    address public immutable A;
+    address public immutable B;
+    address public immutable C;
+    address public D;
+    address public E;
+
+    bool public deAVoted;
+    bool public deBVoted;
+    bool public deCVoted;
+
+    bool public callAVoted;
+    bool public callBVoted;
+    bool public callCVoted;
+    bool public callDVoted;
+    bool public callEVoted;
+
+    mapping(address => bool) public targetWhitelist;
+
+
+    uint256 public quorumTime;
+    uint256 public confirmSetDE;
+    uint256 public setDEStart;
+
+    address public pendingTarget;
+    uint256 public pendingValue;
+    bytes public pendingData;
+    uint256 public confirmCall;
+    uint256 public callStart;
+
+    address public pendingNewD;
+    address public pendingNewE;
+
+    event MemberUpdated(address newD, address newE);
+    event ExternalCalled(address target, uint256 value, bytes data);
+    event ResetSetDEVote();
+    event ResetCallVote();
+    event WhitelistSet(address target, bool enable);
+
+    constructor(
+        address _A, address _B, address _C,
+        address _D, address _E
+    ) {
+        require(_A != address(0) && _B != address(0) && _C != address(0));
+        require(_D != address(0) && _E != address(0));
+        require(_A != _B && _A != _C && _A != _D && _A != _E);
+        require(_B != _C && _B != _D && _B != _E);
+        require(_C != _D && _C != _E);
+        A = _A; B = _B; C = _C;
+        D = _D; E = _E;
+    }
+
+    modifier onlyABC() {
+        require(msg.sender == A || msg.sender == B || msg.sender == C, "not ABC");
+        _;
+    }
+
+    modifier onlyMember() {
+        require(msg.sender == A || msg.sender == B || msg.sender == C
+        || msg.sender == D || msg.sender == E, "not member");
+        _;
+    }
+
+    function setWhitelist(address target, bool enable) external onlyABC {
+        targetWhitelist[target] = enable;
+        emit WhitelistSet(target, enable);
+    }
+
+    function _clearSetDE() private {
+        confirmSetDE = 0;
+        deAVoted = false;
+        deBVoted = false;
+        deCVoted = false;
+        setDEStart = 0;
+        quorumTime = 0;
+        pendingNewD = address(0);
+        pendingNewE = address(0);
+    }
+
+    function _clearCall() private {
+        pendingTarget = address(0);
+        pendingValue = 0;
+        delete pendingData;
+        confirmCall = 0;
+        callAVoted = false;
+        callBVoted = false;
+        callCVoted = false;
+        callDVoted = false;
+        callEVoted = false;
+        callStart = 0;
+    }
+
+    function setDE(address newD, address newE) external nonReentrant onlyABC {
+        if(setDEStart != 0){
+            if(block.timestamp > setDEStart + VOTE_PERIOD){
+                _clearSetDE();
+                emit ResetSetDEVote();
+            }
+        }
+
+        address sender = msg.sender;
+        if (sender == A && !deAVoted) {
+            deAVoted = true;
+        } else if (sender == B && !deBVoted) {
+            deBVoted = true;
+        } else if (sender == C && !deCVoted) {
+            deCVoted = true;
+        } else {
+            revert("sender already voted");
+        }
+
+        if(setDEStart == 0){
+            setDEStart = block.timestamp;
+            pendingNewD = newD;
+            pendingNewE = newE;
+        }else{
+            require(pendingNewD == newD && pendingNewE == newE, "proposal mismatch");
+        }
+
+        confirmSetDE = 0;
+        if(deAVoted) confirmSetDE++;
+        if(deBVoted) confirmSetDE++;
+        if(deCVoted) confirmSetDE++;
+
+        if (confirmSetDE == 3 && quorumTime == 0) {
+            quorumTime = block.timestamp;
+        }
+    }
+
+    function executeSetDE(address /*newD*/, address /*newE*/) external nonReentrant onlyABC {
+        require(confirmSetDE == 3, "quorum not reached");
+        require(setDEStart != 0, "no proposal");
+        require(block.timestamp <= setDEStart + VOTE_PERIOD, "vote expired");
+        require(quorumTime != 0, "quorum time not set");
+        require(block.timestamp >= quorumTime + MODIFY_DE_DELAY, "cooling not finished");
+
+        address newD = pendingNewD;
+        address newE = pendingNewE;
+
+        require(newD != address(0) && newE != address(0) && newD != newE);
+        require(newD != A && newD != B && newD != C);
+        require(newE != A && newE != B && newE != C);
+
+        D = newD;
+        E = newE;
+        emit MemberUpdated(newD, newE);
+        _clearSetDE();
+        _clearCall();
+    }
+
+    function resetSetDEVote() external nonReentrant onlyABC {
+        _clearSetDE();
+        emit ResetSetDEVote();
+    }
+
+function multiCall(address target, uint256 value, bytes calldata data) external nonReentrant onlyMember {
+    if (callStart != 0 && block.timestamp > callStart + VOTE_PERIOD) {
+        callAVoted = false;
+        callBVoted = false;
+        callCVoted = false;
+        callDVoted = false;
+        callEVoted = false;
+        confirmCall = 0;
+
+        pendingTarget = target;
+        pendingValue = value;
+        pendingData = data;
+        callStart = block.timestamp;
+    } else {
+        if (callStart != 0) {
+            require(pendingTarget == target && pendingValue == value && keccak256(pendingData) == keccak256(data),
+                "active proposal mismatch, reset first");
+        } else {
+            pendingTarget = target;
+            pendingValue = value;
+            pendingData = data;
+            callStart = block.timestamp;
+        }
+    }
+
+    address sender = msg.sender;
+    if (sender == A && !callAVoted) {
+        callAVoted = true;
+    } else if (sender == B && !callBVoted) {
+        callBVoted = true;
+    } else if (sender == C && !callCVoted) {
+        callCVoted = true;
+    } else if (sender == D && !callDVoted) {
+        callDVoted = true;
+    } else if (sender == E && !callEVoted) {
+        callEVoted = true;
+    } else {
+        revert("already confirmed");
+    }
+    confirmCall = 0;
+    if (callAVoted) confirmCall++;
+    if (callBVoted) confirmCall++;
+    if (callCVoted) confirmCall++;
+    if (callDVoted) confirmCall++;
+    if (callEVoted) confirmCall++;
+
+    if (confirmCall >= 5) {
+        require(targetWhitelist[target], "target not in whitelist");
+
+        (bool ok, bytes memory ret) = target.call{value: value}(data);
+        require(ok, string(ret));
+
+        emit ExternalCalled(target, value, data);
+        _clearCall(); 
+    }
+}
+
+    function resetCallVote() external nonReentrant onlyMember {
+        _clearCall();
+        emit ResetCallVote();
+    }
+
+    function withdrawEth(uint256 amount) external nonReentrant onlyMember {
+        (bool ok,) = payable(msg.sender).call{value: amount}("");
+        require(ok, "eth transfer fail");
+    }
+
+    function withdrawErc20(address token, uint256 amount) external nonReentrant onlyMember {
+        (bool ok, bytes memory ret) = token.call(abi.encodeWithSignature("transfer(address,uint256)", msg.sender, amount));
+        require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "erc20 transfer fail");
+    }
+
+    receive() external payable{}
+}
